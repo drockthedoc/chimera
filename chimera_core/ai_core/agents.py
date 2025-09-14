@@ -17,6 +17,7 @@ from ..schemas.ai_responses import (
     DialogueResponse, GenerationResponse, AnalysisResponse, 
     ConfidenceLevel, AgentRequest
 )
+from ..utils.structured_generation import StructuredGenerator
 
 
 logger = logging.getLogger(__name__)
@@ -30,9 +31,10 @@ class BaseAgent(ABC):
     structured responses based on their expertise.
     """
     
-    def __init__(self, client: OllamaClient, agent_name: str):
+    def __init__(self, client: OllamaClient, agent_name: str, structured_generator: StructuredGenerator):
         self.client = client
         self.agent_name = agent_name
+        self.structured_generator = structured_generator
         self.system_prompt = self._get_system_prompt()
     
     @abstractmethod
@@ -51,19 +53,8 @@ class BaseAgent(ABC):
             Structured response dictionary
         """
         try:
-            # Build the full prompt with context
-            full_prompt = self._build_prompt(request)
-            
-            # Generate response
-            response_text = await self.client.generate_text(
-                prompt=full_prompt,
-                system_prompt=self.system_prompt,
-                temperature=request.parameters.get("temperature", 0.7),
-                max_tokens=request.parameters.get("max_tokens", 1000)
-            )
-            
-            # Parse and validate response
-            return await self._parse_response(response_text, request)
+            # The _parse_response method is now responsible for both generation and parsing.
+            return await self._parse_response(request)
             
         except Exception as e:
             logger.error(f"Agent {self.agent_name} failed to process request: {e}")
@@ -82,9 +73,9 @@ class BaseAgent(ABC):
             prompt_parts.insert(0, f"Context:\n{context_str}\n")
         
         return "\n".join(prompt_parts)
-    
+
     @abstractmethod
-    async def _parse_response(self, response_text: str, request: AgentRequest) -> Dict[str, Any]:
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
         """Parse the raw response text into a structured format."""
         pass
 
@@ -97,8 +88,8 @@ class DialogueAgent(BaseAgent):
     contextual factors to generate appropriate dialogue responses.
     """
     
-    def __init__(self, client: OllamaClient):
-        super().__init__(client, "DialogueAgent")
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "DialogueAgent", structured_generator)
     
     def _get_system_prompt(self) -> str:
         return """You are a master storyteller and dialogue writer for a fantasy MUD game. 
@@ -115,21 +106,24 @@ Keep responses concise but meaningful, typically 1-3 sentences unless the situat
 
 Format your response as natural dialogue, optionally including brief action descriptions in parentheses."""
     
-    async def _parse_response(self, response_text: str, request: AgentRequest) -> Dict[str, Any]:
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
         """Parse dialogue response."""
-        # Extract character name from context
+        full_prompt = self._build_prompt(request)
+        response_text = await self.client.generate_text(
+            prompt=full_prompt,
+            system_prompt=self.system_prompt,
+            temperature=request.parameters.get("temperature", 0.7),
+            max_tokens=request.parameters.get("max_tokens", 1000)
+        )
+
         character_name = request.context.get("character_name", "Unknown")
-        
-        # Simple parsing - in a full implementation, this could be more sophisticated
         dialogue_text = response_text.strip()
         
-        # Extract actions (text in parentheses)
         actions = []
         import re
         action_matches = re.findall(r'\(([^)]+)\)', dialogue_text)
         actions.extend(action_matches)
         
-        # Remove actions from dialogue text
         clean_dialogue = re.sub(r'\([^)]+\)', '', dialogue_text).strip()
         
         return {
@@ -151,8 +145,8 @@ class GeographyAgent(BaseAgent):
     and creates immersive location descriptions.
     """
     
-    def __init__(self, client: OllamaClient):
-        super().__init__(client, "GeographyAgent")
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "GeographyAgent", structured_generator)
     
     def _get_system_prompt(self) -> str:
         return """You are a master world-builder specializing in geography and locations for a fantasy MUD game.
@@ -173,53 +167,47 @@ When generating locations, consider:
 
 Always ensure your creations fit logically within the existing world structure."""
     
-    async def _parse_response(self, response_text: str, request: AgentRequest) -> Dict[str, Any]:
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
         """Parse geography/room generation response."""
-        try:
-            # Attempt to parse as JSON if structured generation was requested
-            if request.schema_name == "RoomSchema":
-                # Try to parse as structured JSON using the RoomSchema. If
-                # parsing fails, fall back to a basic structure so the caller
-                # still receives useful data.
-                try:
-                    data = json.loads(response_text)
-                    room = RoomSchema(**data)
-                    return {
-                        "response_type": "generation",
-                        "content_type": "room",
-                        "generated_data": room.dict(),
-                        "confidence": ConfidenceLevel.HIGH,
-                        "reasoning": "Structured room data validated against schema",
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed to parse structured room response: {e}")
-                    return {
-                        "response_type": "generation",
-                        "content_type": "room",
-                        "generated_data": {
-                            "name": request.context.get("room_name", "Generated Room"),
-                            "description": response_text.strip(),
-                            "exits": [],
-                            "tags": ["generated"],
-                            "atmosphere": request.context.get("atmosphere", "neutral"),
-                        },
-                        "confidence": ConfidenceLevel.MEDIUM,
-                        "reasoning": "Basic room generation from text description",
-                    }
-            else:
+        schema_map = {"RoomSchema": RoomSchema}
+        content_type = "room"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
                 return {
                     "response_type": "generation",
-                    "content_type": "location_description",
-                    "generated_data": {"description": response_text.strip()},
-                    "confidence": ConfidenceLevel.HIGH
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
                 }
-                
-        except Exception as e:
-            logger.error(f"Failed to parse geography response: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
             return {
-                "response_type": "error",
-                "error": str(e),
-                "raw_response": response_text
+                "response_type": "generation",
+                "content_type": "location_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
             }
 
 
@@ -231,8 +219,8 @@ class CharacterAgent(BaseAgent):
     backgrounds, and motivations that fit within the world.
     """
     
-    def __init__(self, client: OllamaClient):
-        super().__init__(client, "CharacterAgent")
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "CharacterAgent", structured_generator)
     
     def _get_system_prompt(self) -> str:
         return """You are a master character creator for a fantasy MUD game, specializing in NPCs.
@@ -254,51 +242,47 @@ When creating characters, consider:
 
 Create characters that feel alive and have depth beyond their immediate function."""
     
-    async def _parse_response(self, response_text: str, request: AgentRequest) -> Dict[str, Any]:
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
         """Parse character generation response."""
-        try:
-            if request.schema_name == "CharacterSchema":
-                # Attempt structured JSON parsing and validation using the
-                # CharacterSchema. If parsing fails, return a basic structure.
-                try:
-                    data = json.loads(response_text)
-                    character = CharacterSchema(**data)
-                    return {
-                        "response_type": "generation",
-                        "content_type": "character",
-                        "generated_data": character.dict(),
-                        "confidence": ConfidenceLevel.HIGH,
-                        "reasoning": "Structured character data validated against schema",
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed to parse structured character response: {e}")
-                    return {
-                        "response_type": "generation",
-                        "content_type": "character",
-                        "generated_data": {
-                            "name": request.context.get("character_name", "Generated Character"),
-                            "description": response_text.strip(),
-                            "personality": "neutral",
-                            "background": response_text.strip(),
-                            "dialogue_style": "conversational",
-                        },
-                        "confidence": ConfidenceLevel.MEDIUM,
-                        "reasoning": "Basic character generation from text description",
-                    }
-            else:
+        schema_map = {"CharacterSchema": CharacterSchema}
+        content_type = "character"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
                 return {
                     "response_type": "generation",
-                    "content_type": "character_description",
-                    "generated_data": {"description": response_text.strip()},
-                    "confidence": ConfidenceLevel.HIGH
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
                 }
-                
-        except Exception as e:
-            logger.error(f"Failed to parse character response: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
             return {
-                "response_type": "error",
-                "error": str(e),
-                "raw_response": response_text
+                "response_type": "generation",
+                "content_type": "character_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
             }
 
 
@@ -310,8 +294,8 @@ class EventAgent(BaseAgent):
     provide dynamic content for players to discover and interact with.
     """
     
-    def __init__(self, client: OllamaClient):
-        super().__init__(client, "EventAgent")
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "EventAgent", structured_generator)
     
     def _get_system_prompt(self) -> str:
         return """You are a master storyteller and event designer for a fantasy MUD game.
@@ -333,52 +317,47 @@ When creating events, consider:
 
 Create events that feel organic to the world and provide compelling gameplay experiences."""
     
-    async def _parse_response(self, response_text: str, request: AgentRequest) -> Dict[str, Any]:
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
         """Parse event generation response."""
-        try:
-            if request.schema_name == "WorldEventSchema":
-                # Parse and validate the response using WorldEventSchema. If
-                # parsing fails, provide a minimal fallback structure.
-                try:
-                    data = json.loads(response_text)
-                    event = WorldEventSchema(**data)
-                    return {
-                        "response_type": "generation",
-                        "content_type": "world_event",
-                        "generated_data": event.dict(),
-                        "confidence": ConfidenceLevel.HIGH,
-                        "reasoning": "Structured event data validated against schema",
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed to parse structured event response: {e}")
-                    return {
-                        "response_type": "generation",
-                        "content_type": "world_event",
-                        "generated_data": {
-                            "name": request.context.get("event_name", "Generated Event"),
-                            "description": response_text.strip(),
-                            "trigger_conditions": [],
-                            "effects": {},
-                            "repeatable": False,
-                            "global_event": False,
-                        },
-                        "confidence": ConfidenceLevel.MEDIUM,
-                        "reasoning": "Basic event generation from text description",
-                    }
-            else:
+        schema_map = {"WorldEventSchema": WorldEventSchema}
+        content_type = "world_event"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
                 return {
                     "response_type": "generation",
-                    "content_type": "event_description",
-                    "generated_data": {"description": response_text.strip()},
-                    "confidence": ConfidenceLevel.HIGH
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
                 }
-                
-        except Exception as e:
-            logger.error(f"Failed to parse event response: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
             return {
-                "response_type": "error",
-                "error": str(e),
-                "raw_response": response_text
+                "response_type": "generation",
+                "content_type": "event_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
             }
 
 
@@ -392,11 +371,12 @@ class AgentManager:
     
     def __init__(self, client: OllamaClient):
         self.client = client
+        self.structured_generator = StructuredGenerator(client)
         self.agents = {
-            "dialogue": DialogueAgent(client),
-            "geography": GeographyAgent(client),
-            "character": CharacterAgent(client),
-            "event": EventAgent(client)
+            "dialogue": DialogueAgent(client, self.structured_generator),
+            "geography": GeographyAgent(client, self.structured_generator),
+            "character": CharacterAgent(client, self.structured_generator),
+            "event": EventAgent(client, self.structured_generator)
         }
     
     async def invoke_agent(self, agent_type: str, request: AgentRequest) -> Dict[str, Any]:
@@ -464,10 +444,9 @@ async def invoke_dialogue_agent(
     client: Optional[OllamaClient] = None
 ) -> Dict[str, Any]:
     """Convenience function to invoke the dialogue agent."""
-    if client is None:
-        client = OllamaClient()
-    
-    agent = DialogueAgent(client)
+    client = client or OllamaClient()
+    structured_generator = StructuredGenerator(client)
+    agent = DialogueAgent(client, structured_generator)
     request = AgentRequest(
         agent_type="dialogue",
         prompt=prompt,
@@ -484,10 +463,9 @@ async def invoke_geography_agent(
     client: Optional[OllamaClient] = None
 ) -> Dict[str, Any]:
     """Convenience function to invoke the geography agent."""
-    if client is None:
-        client = OllamaClient()
-    
-    agent = GeographyAgent(client)
+    client = client or OllamaClient()
+    structured_generator = StructuredGenerator(client)
+    agent = GeographyAgent(client, structured_generator)
     request = AgentRequest(
         agent_type="geography",
         prompt=prompt,

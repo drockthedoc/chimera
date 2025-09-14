@@ -11,15 +11,11 @@ from evennia import DefaultScript
 from evennia.utils import logger
 
 # Import Chimera core modules
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-
 from chimera_core.ai_core.client import OllamaClient, OllamaConfig
 from chimera_core.ai_core.agents import AgentManager, AgentRequest
 from chimera_core.knowledge_base.manager import KnowledgeManager
 from chimera_core.utils.structured_generation import StructuredGenerator
-from chimera_core.utils.async_helpers import AsyncTaskManager, submit_background_task
+from chimera_core.utils.async_helpers import submit_background_task, get_task_manager
 from chimera_core.schemas.game_objects import RoomSchema, CharacterSchema
 from chimera_core.schemas.ai_responses import DialogueResponse, GenerationResponse
 
@@ -49,7 +45,6 @@ class AIManagerScript(DefaultScript):
         self.agent_manager = None
         self.knowledge_manager = None
         self.structured_generator = None
-        self.task_manager = AsyncTaskManager(max_workers=4)
         
         # Configuration
         self.config = {
@@ -97,16 +92,6 @@ class AIManagerScript(DefaultScript):
         # Generate background content if enabled
         if self.config.get("enable_background_generation", True):
             self._generate_background_content()
-    
-    def at_stop(self):
-        """Called when the script stops."""
-        logger.log_info("AI Manager Script stopping...")
-        
-        # Shutdown task manager
-        if self.task_manager:
-            self.task_manager.shutdown(wait=False)
-        
-        logger.log_info("AI Manager Script stopped")
     
     def _initialize_ai_components(self):
         """Initialize all AI components."""
@@ -157,12 +142,13 @@ class AIManagerScript(DefaultScript):
     
     def _process_completed_tasks(self):
         """Process completed background tasks."""
+        task_manager = get_task_manager()
         completed_task_ids = []
         
         for task_id, task_info in self.active_tasks.items():
-            if self.task_manager.is_task_done(task_id):
+            if task_manager.is_task_done(task_id):
                 try:
-                    result = self.task_manager.get_task_result(task_id, timeout=0.1)
+                    result = task_manager.get_task_result(task_id, timeout=0.1)
                     self.completed_tasks[task_id] = {
                         "result": result,
                         "task_info": task_info,
@@ -275,7 +261,7 @@ class AIManagerScript(DefaultScript):
             )
             return await self.agent_manager.invoke_agent("event", agent_request)
 
-        task_id = self.task_manager.submit_async_task(
+        task_id = submit_background_task(
             _generate_event(),
             task_name=f"background_event_{len(self.active_tasks)}",
         )
@@ -307,7 +293,7 @@ class AIManagerScript(DefaultScript):
         async def _generate():
             return await self.structured_generator.generate_room(prompt)
         
-        task_id = self.task_manager.submit_async_task(
+        task_id = submit_background_task(
             _generate(),
             task_name=f"generate_room_{len(self.active_tasks)}",
             callback=callback
@@ -342,7 +328,7 @@ class AIManagerScript(DefaultScript):
         async def _generate():
             return await self.structured_generator.generate_character(prompt)
         
-        task_id = self.task_manager.submit_async_task(
+        task_id = submit_background_task(
             _generate(),
             task_name=f"generate_character_{len(self.active_tasks)}",
             callback=callback
@@ -384,7 +370,7 @@ class AIManagerScript(DefaultScript):
             )
             return await self.agent_manager.invoke_agent("dialogue", agent_request)
         
-        task_id = self.task_manager.submit_async_task(
+        task_id = submit_background_task(
             _generate(),
             task_name=f"dialogue_{character_obj.key}_{len(self.active_tasks)}",
             callback=callback
@@ -411,7 +397,7 @@ class AIManagerScript(DefaultScript):
             Task status information
         """
         if task_id in self.active_tasks:
-            is_done = self.task_manager.is_task_done(task_id)
+            is_done = get_task_manager().is_task_done(task_id)
             return {
                 "status": "completed" if is_done else "running",
                 "task_info": self.active_tasks[task_id]

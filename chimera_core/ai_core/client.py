@@ -227,6 +227,10 @@ class OllamaClient:
         
         # Handle list of strings
         else:
+            # Note: The Ollama API for embeddings processes one prompt at a time.
+            # This loop sends a separate request for each text in the list, which
+            # is inefficient but necessary due to the API's design. If the API
+            # supports batching in the future, this should be refactored.
             embeddings = []
             for t in text:
                 data = {
