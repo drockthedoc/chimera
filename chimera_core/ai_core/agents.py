@@ -1,0 +1,476 @@
+"""
+AI Agents for Project Chimera.
+
+This module implements specialized AI agents for different aspects of
+world generation and management, each with their own expertise and prompts.
+"""
+
+import json
+import logging
+from typing import Dict, Any, List, Optional, Type
+from abc import ABC, abstractmethod
+from pydantic import BaseModel
+
+from .client import OllamaClient, OllamaConfig
+from ..schemas.game_objects import RoomSchema, CharacterSchema, ItemSchema, WorldEventSchema
+from ..schemas.ai_responses import (
+    DialogueResponse, GenerationResponse, AnalysisResponse, 
+    ConfidenceLevel, AgentRequest
+)
+from ..utils.structured_generation import StructuredGenerator
+
+
+logger = logging.getLogger(__name__)
+
+
+class BaseAgent(ABC):
+    """
+    Base class for all AI agents in the Chimera system.
+    
+    Each agent specializes in a particular domain and provides
+    structured responses based on their expertise.
+    """
+    
+    def __init__(self, client: OllamaClient, agent_name: str, structured_generator: StructuredGenerator):
+        self.client = client
+        self.agent_name = agent_name
+        self.structured_generator = structured_generator
+        self.system_prompt = self._get_system_prompt()
+    
+    @abstractmethod
+    def _get_system_prompt(self) -> str:
+        """Get the system prompt that defines this agent's role and expertise."""
+        pass
+    
+    async def process_request(self, request: AgentRequest) -> Dict[str, Any]:
+        """
+        Process a request and return a structured response.
+        
+        Args:
+            request: The agent request containing prompt and context
+            
+        Returns:
+            Structured response dictionary
+        """
+        try:
+            # The _parse_response method is now responsible for both generation and parsing.
+            return await self._parse_response(request)
+            
+        except Exception as e:
+            logger.error(f"Agent {self.agent_name} failed to process request: {e}")
+            return {
+                "error": str(e),
+                "agent": self.agent_name,
+                "confidence": ConfidenceLevel.LOW
+            }
+    
+    def _build_prompt(self, request: AgentRequest) -> str:
+        """Build the full prompt including context and instructions."""
+        prompt_parts = [request.prompt]
+        
+        if request.context:
+            context_str = "\n".join([f"{k}: {v}" for k, v in request.context.items()])
+            prompt_parts.insert(0, f"Context:\n{context_str}\n")
+        
+        return "\n".join(prompt_parts)
+
+    @abstractmethod
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
+        """Parse the raw response text into a structured format."""
+        pass
+
+
+class DialogueAgent(BaseAgent):
+    """
+    Agent specialized in generating character dialogue and interactions.
+    
+    This agent understands character personalities, relationships, and
+    contextual factors to generate appropriate dialogue responses.
+    """
+    
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "DialogueAgent", structured_generator)
+    
+    def _get_system_prompt(self) -> str:
+        return """You are a master storyteller and dialogue writer for a fantasy MUD game. 
+Your expertise is in creating authentic, engaging character dialogue that reflects:
+
+1. Character personality and background
+2. Current emotional state and relationships
+3. World lore and setting consistency
+4. Natural speech patterns and mannerisms
+
+Always respond with dialogue that feels natural and advances the narrative.
+Consider the character's goals, fears, and motivations in every response.
+Keep responses concise but meaningful, typically 1-3 sentences unless the situation calls for more.
+
+Format your response as natural dialogue, optionally including brief action descriptions in parentheses."""
+    
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
+        """Parse dialogue response."""
+        full_prompt = self._build_prompt(request)
+        response_text = await self.client.generate_text(
+            prompt=full_prompt,
+            system_prompt=self.system_prompt,
+            temperature=request.parameters.get("temperature", 0.7),
+            max_tokens=request.parameters.get("max_tokens", 1000)
+        )
+
+        character_name = request.context.get("character_name", "Unknown")
+        dialogue_text = response_text.strip()
+        
+        actions = []
+        import re
+        action_matches = re.findall(r'\(([^)]+)\)', dialogue_text)
+        actions.extend(action_matches)
+        
+        clean_dialogue = re.sub(r'\([^)]+\)', '', dialogue_text).strip()
+        
+        return {
+            "response_type": "dialogue",
+            "character_name": character_name,
+            "text": clean_dialogue,
+            "actions": actions,
+            "emotion": request.context.get("emotion"),
+            "confidence": ConfidenceLevel.HIGH,
+            "context": request.context
+        }
+
+
+class GeographyAgent(BaseAgent):
+    """
+    Agent specialized in generating rooms, locations, and geographical features.
+    
+    This agent understands spatial relationships, environmental consistency,
+    and creates immersive location descriptions.
+    """
+    
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "GeographyAgent", structured_generator)
+    
+    def _get_system_prompt(self) -> str:
+        return """You are a master world-builder specializing in geography and locations for a fantasy MUD game.
+Your expertise includes:
+
+1. Creating vivid, immersive room descriptions
+2. Establishing logical spatial relationships and exits
+3. Maintaining environmental consistency
+4. Incorporating appropriate atmosphere and mood
+5. Suggesting suitable items, NPCs, and interactive elements
+
+When generating locations, consider:
+- Climate and terrain type
+- Cultural influences and inhabitants
+- Historical significance
+- Practical purposes and functions
+- Sensory details (sights, sounds, smells)
+
+Always ensure your creations fit logically within the existing world structure."""
+    
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
+        """Parse geography/room generation response."""
+        schema_map = {"RoomSchema": RoomSchema}
+        content_type = "room"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
+                }
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
+            return {
+                "response_type": "generation",
+                "content_type": "location_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
+            }
+
+
+class CharacterAgent(BaseAgent):
+    """
+    Agent specialized in generating NPCs, their personalities, and behaviors.
+    
+    This agent creates compelling characters with consistent personalities,
+    backgrounds, and motivations that fit within the world.
+    """
+    
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "CharacterAgent", structured_generator)
+    
+    def _get_system_prompt(self) -> str:
+        return """You are a master character creator for a fantasy MUD game, specializing in NPCs.
+Your expertise includes:
+
+1. Developing unique, memorable personalities
+2. Creating consistent character backgrounds and motivations
+3. Establishing relationships and social dynamics
+4. Defining character goals, fears, and quirks
+5. Ensuring characters fit naturally within the world setting
+
+When creating characters, consider:
+- Their role in the community/world
+- Personal history and formative experiences
+- Speech patterns and mannerisms
+- Skills, abilities, and knowledge
+- Relationships with other characters
+- Internal conflicts and growth potential
+
+Create characters that feel alive and have depth beyond their immediate function."""
+    
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
+        """Parse character generation response."""
+        schema_map = {"CharacterSchema": CharacterSchema}
+        content_type = "character"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
+                }
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
+            return {
+                "response_type": "generation",
+                "content_type": "character_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
+            }
+
+
+class EventAgent(BaseAgent):
+    """
+    Agent specialized in generating world events, quests, and dynamic content.
+    
+    This agent creates engaging events that can drive narrative and
+    provide dynamic content for players to discover and interact with.
+    """
+    
+    def __init__(self, client: OllamaClient, structured_generator: StructuredGenerator):
+        super().__init__(client, "EventAgent", structured_generator)
+    
+    def _get_system_prompt(self) -> str:
+        return """You are a master storyteller and event designer for a fantasy MUD game.
+Your expertise includes:
+
+1. Creating engaging world events and storylines
+2. Designing meaningful quests and objectives
+3. Establishing cause-and-effect relationships
+4. Balancing challenge and reward
+5. Maintaining narrative consistency and pacing
+
+When creating events, consider:
+- Player agency and meaningful choices
+- World state and ongoing storylines
+- Appropriate difficulty and scope
+- Long-term consequences and implications
+- Opportunities for character development
+- Integration with existing world elements
+
+Create events that feel organic to the world and provide compelling gameplay experiences."""
+    
+    async def _parse_response(self, request: AgentRequest) -> Dict[str, Any]:
+        """Parse event generation response."""
+        schema_map = {"WorldEventSchema": WorldEventSchema}
+        content_type = "world_event"
+
+        if schema_class := schema_map.get(request.schema_name):
+            try:
+                generated_data = await self.structured_generator.generate_structured_content(
+                    prompt=request.prompt,
+                    schema_class=schema_class,
+                    system_prompt=self.system_prompt,
+                )
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": generated_data,
+                    "confidence": ConfidenceLevel.HIGH,
+                    "reasoning": f"Structured {content_type} data validated against schema",
+                }
+            except Exception as e:
+                logger.warning(f"Failed to parse structured {content_type} response: {e}")
+                return {
+                    "response_type": "generation",
+                    "content_type": content_type,
+                    "generated_data": {"description": str(e)},
+                    "confidence": ConfidenceLevel.LOW,
+                    "reasoning": f"Structured generation failed: {e}",
+                }
+        else:
+            full_prompt = self._build_prompt(request)
+            response_text = await self.client.generate_text(
+                prompt=full_prompt,
+                system_prompt=self.system_prompt,
+                temperature=request.parameters.get("temperature", 0.7),
+                max_tokens=request.parameters.get("max_tokens", 1000)
+            )
+            return {
+                "response_type": "generation",
+                "content_type": "event_description",
+                "generated_data": {"description": response_text.strip()},
+                "confidence": ConfidenceLevel.HIGH
+            }
+
+
+class AgentManager:
+    """
+    Manager class for coordinating multiple AI agents.
+    
+    This class provides a unified interface for invoking different agents
+    and can coordinate multi-agent responses when needed.
+    """
+    
+    def __init__(self, client: OllamaClient):
+        self.client = client
+        self.structured_generator = StructuredGenerator(client)
+        self.agents = {
+            "dialogue": DialogueAgent(client, self.structured_generator),
+            "geography": GeographyAgent(client, self.structured_generator),
+            "character": CharacterAgent(client, self.structured_generator),
+            "event": EventAgent(client, self.structured_generator)
+        }
+    
+    async def invoke_agent(self, agent_type: str, request: AgentRequest) -> Dict[str, Any]:
+        """
+        Invoke a specific agent with a request.
+        
+        Args:
+            agent_type: Type of agent to invoke
+            request: The request to process
+            
+        Returns:
+            Agent response
+        """
+        if agent_type not in self.agents:
+            return {
+                "error": f"Unknown agent type: {agent_type}",
+                "available_agents": list(self.agents.keys())
+            }
+        
+        agent = self.agents[agent_type]
+        return await agent.process_request(request)
+    
+    async def multi_agent_consultation(
+        self, 
+        primary_agent: str, 
+        request: AgentRequest,
+        consulting_agents: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Get input from multiple agents on a request.
+        
+        Args:
+            primary_agent: The primary agent to handle the request
+            request: The request to process
+            consulting_agents: Additional agents to consult
+            
+        Returns:
+            Multi-agent response with consensus information
+        """
+        consulting_agents = consulting_agents or []
+
+        # Get primary agent response
+        primary_response = await self.invoke_agent(primary_agent, request)
+
+        # Collect input from consulting agents
+        consultation_results = {}
+        for agent_name in consulting_agents:
+            if agent_name == primary_agent or agent_name not in self.agents:
+                continue
+            consultation_results[agent_name] = await self.invoke_agent(
+                agent_name, request
+            )
+
+        if consultation_results:
+            primary_response["consultations"] = consultation_results
+
+        return primary_response
+
+
+# Convenience functions for common agent operations
+async def invoke_dialogue_agent(
+    character_name: str,
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+    client: Optional[OllamaClient] = None
+) -> Dict[str, Any]:
+    """Convenience function to invoke the dialogue agent."""
+    client = client or OllamaClient()
+    structured_generator = StructuredGenerator(client)
+    agent = DialogueAgent(client, structured_generator)
+    request = AgentRequest(
+        agent_type="dialogue",
+        prompt=prompt,
+        context=context or {"character_name": character_name}
+    )
+    
+    return await agent.process_request(request)
+
+
+async def invoke_geography_agent(
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+    schema_name: Optional[str] = None,
+    client: Optional[OllamaClient] = None
+) -> Dict[str, Any]:
+    """Convenience function to invoke the geography agent."""
+    client = client or OllamaClient()
+    structured_generator = StructuredGenerator(client)
+    agent = GeographyAgent(client, structured_generator)
+    request = AgentRequest(
+        agent_type="geography",
+        prompt=prompt,
+        context=context or {},
+        schema_name=schema_name
+    )
+    
+    return await agent.process_request(request)
