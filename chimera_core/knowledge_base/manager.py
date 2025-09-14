@@ -458,14 +458,41 @@ class KnowledgeManager:
     async def cleanup_expired_documents(self) -> int:
         """
         Clean up expired documents from all collections.
-        
+
         Returns:
             Number of documents cleaned up
         """
-        # TODO: Implement cleanup logic
-        # This would involve querying for expired documents and deleting them
-        logger.info("Document cleanup not yet implemented")
-        return 0
+        removed_total = 0
+        now_iso = datetime.utcnow().isoformat()
+
+        for name, collection in self.collections.items():
+            try:
+                delete_data = {
+                    "database_name": self.infinity_client.config.database_name,
+                    "collection_name": collection,
+                    "filter": {"expires_at": {"$lte": now_iso}},
+                }
+
+                # Use the Infinity API to delete all expired documents in one call.
+                response = await self.infinity_client._make_request(
+                    "DELETE", "documents", delete_data
+                )
+
+                # Different backends may return different keys for the number of
+                # deleted documents, so handle common possibilities.
+                removed = (
+                    response.get("deleted", 0)
+                    or response.get("num_deleted", 0)
+                    or len(response.get("deleted_ids", []))
+                )
+                removed_total += removed
+            except Exception as e:
+                logger.warning(
+                    f"Failed to cleanup expired documents in collection '{collection}': {e}"
+                )
+
+        logger.info(f"Removed {removed_total} expired documents from knowledge base")
+        return removed_total
     
     async def get_knowledge_stats(self) -> Dict[str, Any]:
         """

@@ -191,6 +191,8 @@ class AIManagerScript(DefaultScript):
             self._handle_character_generation_complete(task_id, task_info, result)
         elif task_type == "dialogue_response":
             self._handle_dialogue_complete(task_id, task_info, result)
+        elif task_type == "background_event":
+            self._handle_background_event(task_id, task_info, result)
         elif task_type == "test_ollama":
             logger.log_info(f"Ollama connection test: {'OK' if result else 'FAILED'}")
         elif task_type == "test_infinity":
@@ -234,6 +236,16 @@ class AIManagerScript(DefaultScript):
             logger.log_info(f"Dialogue generated for {character_name}")
         else:
             logger.log_err(f"Dialogue generation failed for task {task_id}")
+
+    def _handle_background_event(self, task_id: str, task_info: Dict[str, Any], result: Any):
+        """Handle completed background event generation."""
+        if result and isinstance(result, dict):
+            description = result.get("description") or result.get("generated_data", {}).get(
+                "description", ""
+            )
+            logger.log_info(f"Background event: {description}")
+        else:
+            logger.log_err(f"Background event generation failed for task {task_id}")
     
     def _background_maintenance(self):
         """Perform background maintenance tasks."""
@@ -253,14 +265,25 @@ class AIManagerScript(DefaultScript):
         # Only generate if we don't have too many active tasks
         if len(self.active_tasks) >= self.config.get("max_concurrent_tasks", 4):
             return
-        
-        # TODO: Implement background content generation
-        # This could include:
-        # - Random events
-        # - NPC behavior updates
-        # - World state changes
-        # - New content generation based on player activity
-        pass
+
+        # Generate a simple background world event using the event agent.
+        async def _generate_event():
+            agent_request = AgentRequest(
+                agent_type="event",
+                prompt="Generate a brief background event happening in the world.",
+                schema_name="WorldEventSchema",
+            )
+            return await self.agent_manager.invoke_agent("event", agent_request)
+
+        task_id = self.task_manager.submit_async_task(
+            _generate_event(),
+            task_name=f"background_event_{len(self.active_tasks)}",
+        )
+
+        self.active_tasks[task_id] = {
+            "type": "background_event",
+            "started_at": self.db.time,
+        }
     
     # Public API methods for other game objects to use
     

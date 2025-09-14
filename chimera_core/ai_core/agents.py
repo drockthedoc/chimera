@@ -178,21 +178,34 @@ Always ensure your creations fit logically within the existing world structure."
         try:
             # Attempt to parse as JSON if structured generation was requested
             if request.schema_name == "RoomSchema":
-                # TODO: Implement structured JSON parsing with schema validation
-                # For now, return a basic structure
-                return {
-                    "response_type": "generation",
-                    "content_type": "room",
-                    "generated_data": {
-                        "name": "Generated Room",
-                        "description": response_text.strip(),
-                        "exits": [],
-                        "tags": ["generated"],
-                        "atmosphere": request.context.get("atmosphere", "neutral")
-                    },
-                    "confidence": ConfidenceLevel.MEDIUM,
-                    "reasoning": "Basic room generation from text description"
-                }
+                # Try to parse as structured JSON using the RoomSchema. If
+                # parsing fails, fall back to a basic structure so the caller
+                # still receives useful data.
+                try:
+                    data = json.loads(response_text)
+                    room = RoomSchema(**data)
+                    return {
+                        "response_type": "generation",
+                        "content_type": "room",
+                        "generated_data": room.dict(),
+                        "confidence": ConfidenceLevel.HIGH,
+                        "reasoning": "Structured room data validated against schema",
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to parse structured room response: {e}")
+                    return {
+                        "response_type": "generation",
+                        "content_type": "room",
+                        "generated_data": {
+                            "name": request.context.get("room_name", "Generated Room"),
+                            "description": response_text.strip(),
+                            "exits": [],
+                            "tags": ["generated"],
+                            "atmosphere": request.context.get("atmosphere", "neutral"),
+                        },
+                        "confidence": ConfidenceLevel.MEDIUM,
+                        "reasoning": "Basic room generation from text description",
+                    }
             else:
                 return {
                     "response_type": "generation",
@@ -245,21 +258,33 @@ Create characters that feel alive and have depth beyond their immediate function
         """Parse character generation response."""
         try:
             if request.schema_name == "CharacterSchema":
-                # TODO: Implement structured JSON parsing with schema validation
-                # For now, return a basic structure
-                return {
-                    "response_type": "generation",
-                    "content_type": "character",
-                    "generated_data": {
-                        "name": request.context.get("character_name", "Generated Character"),
-                        "description": response_text.strip(),
-                        "personality": "neutral",
-                        "background": response_text.strip(),
-                        "dialogue_style": "conversational"
-                    },
-                    "confidence": ConfidenceLevel.MEDIUM,
-                    "reasoning": "Basic character generation from text description"
-                }
+                # Attempt structured JSON parsing and validation using the
+                # CharacterSchema. If parsing fails, return a basic structure.
+                try:
+                    data = json.loads(response_text)
+                    character = CharacterSchema(**data)
+                    return {
+                        "response_type": "generation",
+                        "content_type": "character",
+                        "generated_data": character.dict(),
+                        "confidence": ConfidenceLevel.HIGH,
+                        "reasoning": "Structured character data validated against schema",
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to parse structured character response: {e}")
+                    return {
+                        "response_type": "generation",
+                        "content_type": "character",
+                        "generated_data": {
+                            "name": request.context.get("character_name", "Generated Character"),
+                            "description": response_text.strip(),
+                            "personality": "neutral",
+                            "background": response_text.strip(),
+                            "dialogue_style": "conversational",
+                        },
+                        "confidence": ConfidenceLevel.MEDIUM,
+                        "reasoning": "Basic character generation from text description",
+                    }
             else:
                 return {
                     "response_type": "generation",
@@ -312,21 +337,34 @@ Create events that feel organic to the world and provide compelling gameplay exp
         """Parse event generation response."""
         try:
             if request.schema_name == "WorldEventSchema":
-                # TODO: Implement structured JSON parsing with schema validation
-                return {
-                    "response_type": "generation",
-                    "content_type": "world_event",
-                    "generated_data": {
-                        "name": request.context.get("event_name", "Generated Event"),
-                        "description": response_text.strip(),
-                        "trigger_conditions": [],
-                        "effects": {},
-                        "repeatable": False,
-                        "global_event": False
-                    },
-                    "confidence": ConfidenceLevel.MEDIUM,
-                    "reasoning": "Basic event generation from text description"
-                }
+                # Parse and validate the response using WorldEventSchema. If
+                # parsing fails, provide a minimal fallback structure.
+                try:
+                    data = json.loads(response_text)
+                    event = WorldEventSchema(**data)
+                    return {
+                        "response_type": "generation",
+                        "content_type": "world_event",
+                        "generated_data": event.dict(),
+                        "confidence": ConfidenceLevel.HIGH,
+                        "reasoning": "Structured event data validated against schema",
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to parse structured event response: {e}")
+                    return {
+                        "response_type": "generation",
+                        "content_type": "world_event",
+                        "generated_data": {
+                            "name": request.context.get("event_name", "Generated Event"),
+                            "description": response_text.strip(),
+                            "trigger_conditions": [],
+                            "effects": {},
+                            "repeatable": False,
+                            "global_event": False,
+                        },
+                        "confidence": ConfidenceLevel.MEDIUM,
+                        "reasoning": "Basic event generation from text description",
+                    }
             else:
                 return {
                     "response_type": "generation",
@@ -398,9 +436,24 @@ class AgentManager:
         Returns:
             Multi-agent response with consensus information
         """
-        # TODO: Implement multi-agent consultation logic
-        # For now, just return the primary agent response
-        return await self.invoke_agent(primary_agent, request)
+        consulting_agents = consulting_agents or []
+
+        # Get primary agent response
+        primary_response = await self.invoke_agent(primary_agent, request)
+
+        # Collect input from consulting agents
+        consultation_results = {}
+        for agent_name in consulting_agents:
+            if agent_name == primary_agent or agent_name not in self.agents:
+                continue
+            consultation_results[agent_name] = await self.invoke_agent(
+                agent_name, request
+            )
+
+        if consultation_results:
+            primary_response["consultations"] = consultation_results
+
+        return primary_response
 
 
 # Convenience functions for common agent operations

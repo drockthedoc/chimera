@@ -296,8 +296,23 @@ class ConstrainedGenerator:
     
     def __init__(self, ollama_client: Optional[OllamaClient] = None):
         self.ollama_client = ollama_client or OllamaClient()
-        # TODO: Initialize constraint-based generation library
-        logger.info("ConstrainedGenerator initialized (constraint library integration pending)")
+
+        # Attempt to import an external constraint library (like `outlines`).
+        # If unavailable, we'll fall back to our structured generator which
+        # already performs schema validation via Pydantic.
+        try:  # pragma: no cover - optional dependency
+            from outlines import models, generate  # type: ignore
+
+            self._outlines_models = models
+            self._outlines_generate = generate
+            logger.info("ConstrainedGenerator initialized with outlines library")
+        except Exception:  # outlines is optional and may not be installed
+            self._outlines_models = None
+            self._outlines_generate = None
+            logger.info(
+                "ConstrainedGenerator initialized without external constraint library;"
+                " using Pydantic validation fallback"
+            )
     
     async def generate_with_constraints(
         self,
@@ -319,10 +334,27 @@ class ConstrainedGenerator:
         Returns:
             Guaranteed valid structured data
         """
-        # TODO: Implement constraint-based generation
-        # For now, fall back to the structured generator
-        logger.warning("Constraint-based generation not yet implemented, falling back to structured generation")
-        
+        # If we have an external constraint library available, try to use it.
+        if self._outlines_models and self._outlines_generate:  # pragma: no cover - optional path
+            try:
+                schema = schema_class.schema()
+                model = self._outlines_models.ollama(
+                    self.ollama_client.config.default_model,
+                    base_url=self.ollama_client.config.base_url,
+                )
+                generator = self._outlines_generate.json(model, schema)
+                result = await generator(prompt, **kwargs)
+                if isinstance(result, str):
+                    result = json.loads(result)
+                validated = schema_class(**result)
+                return validated.dict()
+            except Exception as e:
+                logger.warning(
+                    "External constraint generation failed (%s); falling back to structured generation",
+                    e,
+                )
+
+        # Fall back to the structured generator which enforces schema via Pydantic
         structured_gen = StructuredGenerator(self.ollama_client)
         return await structured_gen.generate_structured_content(prompt, schema_class, **kwargs)
 
